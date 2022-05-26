@@ -1,2 +1,2 @@
-# TheRealSalmon.github.io
+# therealsalmon.github.io
 Personal Website
