@@ -1,5 +1,9 @@
 from typing import Union
+import tempfile
+import subprocess
+
 from rdkit import Chem
+from rdkit import Geometry
 from rdkit.Chem import (
     rdMolDescriptors,
     rdDistGeom,
@@ -12,6 +16,7 @@ def get_low_energy_conformer(
     input_mol: Union[str, Chem.rdchem.Mol],
     max_iters: int = 200,
     allow_more_rot_bonds: bool = False,
+    allow_unconverged: bool = False,
 ) -> Chem.rdchem.Mol:
     """
     Obtain the lowest energy conformer.
@@ -87,12 +92,92 @@ def get_low_energy_conformer(
             conformers.append(mol.GetConformer(i))
             energies.append(tup[1])
     if len(conformers) == 0:
-        raise ValueError('MMFF94 optimization failed, raise max_iters')
+        if not allow_unconverged:
+            raise ValueError(f'MMFF94 optimization failed for {Chem.MolToSmiles(mol)}, raise max_iters')
+        print(f'MMFF94 optimization failed for {Chem.MolToSmiles(mol)}, raise max_iters')
+        for i, tup in enumerate(tuple_success_energy):
+            conformers.append(mol.GetConformer(i))
+            energies.append(tup[1])
     # sorts conformers and energies together on the energies
     energies, conformers = zip(*sorted(zip(energies, conformers)))
 
     low_e_mol.AddConformer(conformers[0])
     return low_e_mol
+
+
+def xtb_geom_opt(input_mol: Chem.rdchem.Mol,
+                 charge: int = 0,
+                 e_state: int = 0,
+                 solvent: str = 'water',
+                 mmff_max_iters: int = 200) -> Chem.rdchem.Mol:
+    """Use xtb to perform a geometry optimization.
+
+    Examples
+    --------
+    mol = Chem.MolFromSmiles('OCCCO')
+    mol = get_low_energy_conformer(mol)
+    mol = xtb_geom_opt(mol)
+
+    Parameters
+    ----------
+    mol: `rdkit.Chem.rdchem.Mol`
+        The input RDKit mol object.
+    charge: `int`, default = 0
+        The total charge of the molecule
+    e_state: `int`, default = 0
+        N_alpha - N_beta. The difference between the number of spin up and
+        spin down electrons. Should usually be 0 unless you are running open
+        shell or triplet calculations.
+    solvent: `str`, default = ''
+        The solvent used for xtb calculations. Choices are acetone,
+        acetonitrile, ch2cl2, chcl3, cs2, dmf, dmso, ether, h2o, methanol,
+        n-hexane, thf, toluene. The default is no solvent.
+    mmff_max_iters: `int`, default = 200
+        The number of iterations RDKit's MMFF optimizer will use.
+
+    Returns
+    -------
+    `rdkit.Chem.rdchem.Mol`
+        An RDKit Mol object embedded with an optimized structure."""
+    # makes sure that there is a conformer embedded in mol
+    mol = Chem.rdchem.Mol(input_mol)
+    if len(mol.GetConformers()) == 0:
+        mol = get_low_energy_conformer(mol, mmff_max_iters)
+
+    # runs calculations in tmp directory
+    with tempfile.TemporaryDirectory() as tmp:
+        # create .xyz file in the tmp directory
+        Chem.rdmolfiles.MolToXYZFile(mol, f'{tmp}/input.xyz')
+        # run xtb on the input file
+        xtb_args = ['-c', str(charge), '-u', str(e_state)]
+        if solvent != '':
+            xtb_args += ['-alpb', solvent]
+        proc = subprocess.run(['xtb', 'input.xyz', '--opt'] + xtb_args,
+                              cwd=tmp,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL)
+        if proc.returncode != 0:
+            raise SystemError('xtb abnormal termination')
+        with open(f'{tmp}/xtbopt.xyz') as file:
+            xtb_out = file.read()
+
+    # add xtb_energy property to mol
+    energy = float(xtb_out.split('\n')[1].split()[1])
+    mol.SetDoubleProp('xtb_energy_hartrees', energy)
+    mol.SetDoubleProp('xtb_energy_kcalmol', energy*627.5)
+
+    # creates a new RDKit Mol with embedded conformer from the xtb xyz output
+    xtb_xyz = xtb_out.split('\n')[2:]
+    xtb_xyz.remove('')
+    mol.RemoveAllConformers()
+    conf = Chem.rdchem.Conformer(mol.GetNumAtoms())
+    for i, line in enumerate(xtb_xyz):
+        ls = line.split()
+        x, y, z = float(ls[1]), float(ls[2]), float(ls[3])
+        conf.SetAtomPosition(i, Geometry.rdGeometry.Point3D(x, y, z))
+    mol.AddConformer(conf)
+    return mol
+
 
 def remove_nonpolar_hs(input_mol: Chem.rdchem.Mol) -> Chem.rdchem.Mol:
     """Remove nonpolar hydrogen atoms.
